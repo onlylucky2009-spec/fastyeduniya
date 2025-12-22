@@ -18,9 +18,9 @@ IST = pytz.timezone("Asia/Kolkata")
 # --- STOCK UNIVERSE ---
 # Yahan apni 500+ stocks ki list paste karein
 STOCK_INDEX_MAPPING = {
-    # 'RELIANCE': 'NIFTY 50', 
-    # 'TCS': 'NIFTY 50',
-}
+'MINDTECK': 'NIFTY 500',
+'NITIRAJ': 'NIFTY 500',
+} 
 
 async def fetch_and_sync_stock(kite, t_id, symbol, semaphore):
     """
