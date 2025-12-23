@@ -6,6 +6,7 @@ import pytz
 from redis_manager import TradeControl
 
 # --- LOGGING SETUP ---
+# Using a specific logger name to track engine flow in Heroku logs
 logger = logging.getLogger("Nexus_Breakout")
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -14,22 +15,21 @@ class BreakoutEngine:
     @staticmethod
     async def run(token: int, ltp: float, vol: int, state: dict):
         """
-        The main asynchronous entry point for tick processing.
-        Called for every price update.
+        Main entry point. Processes every tick.
         """
         stock = state["stocks"].get(token)
         if not stock:
             return
 
-        # 1. MONITOR ACTIVE TRADES (PnL & Exits)
+        # 1. MONITOR ACTIVE TRADES
         if stock['status'] == 'OPEN':
             await BreakoutEngine.monitor_active_trade(stock, ltp, state)
             return
 
-        # 2. TRIGGER WATCH (Check if price hits the high of the breakout candle)
+        # 2. TRIGGER WATCH
         if stock['status'] == 'TRIGGER_WATCH':
             if stock['side_latch'] == 'BULL' and ltp >= stock['trigger_px']:
-                # Open trade is an async operation due to Redis limit checks
+                logger.info(f"⚡ [TRIGGER] {stock['symbol']} hit trigger price {stock['trigger_px']}. Opening trade...")
                 await BreakoutEngine.open_trade(token, stock, ltp, state)
             return
 
@@ -38,21 +38,17 @@ class BreakoutEngine:
         bucket = now.replace(second=0, microsecond=0)
 
         if stock['candle'] and stock['candle']['bucket'] != bucket:
-            # Current minute finished. Process the candle in a background task
-            # so the main tick loop stays 'superfast'.
+            # Process the closed candle
             asyncio.create_task(BreakoutEngine.analyze_candle_logic(token, stock['candle'], state))
-            
             # Reset for new minute
             stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
         elif not stock['candle']:
             stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
         else:
-            # Update OHLC
             c = stock['candle']
             c['high'] = max(c['high'], ltp)
             c['low'] = min(c['low'], ltp)
             c['close'] = ltp
-            # Calculate Volume Delta
             if stock['last_vol'] > 0:
                 c['volume'] += max(0, vol - stock['last_vol'])
         
@@ -61,102 +57,134 @@ class BreakoutEngine:
     @staticmethod
     async def analyze_candle_logic(token: int, candle: dict, state: dict):
         """
-        Processes the closed 1-minute candle. 
-        Checks against PDH and Volume Matrix.
+        Processes closed candle. Checks against Dashboard settings.
         """
         stock = state["stocks"][token]
         pdh = stock.get('pdh', 0)
+        symbol = stock['symbol']
         
-        # Guard: Check if PDH exists and if Bull Engine is toggled ON
-        if pdh <= 0 or not state["engine_live"].get("bull"):
+        # --- COMPATIBILITY & DASHBOARD CHECK ---
+        is_bull_live = state["engine_live"].get("bull", False)
+        
+        if not is_bull_live:
+            # Silent return to avoid log spam, engine is simply OFF
             return
 
-        # LOGIC: Current Candle crossed PDH from below
+        if pdh <= 0:
+            logger.warning(f"⚠️ [SKIP] {symbol}: No PDH data found. Cannot check breakout.")
+            return
+
+        # LOGIC: Breakout of PDH
+        # Open must be below PDH, Close must be above PDH
         if candle['open'] < pdh and candle['close'] > pdh:
-            logger.info(f"🔍 [SCAN] {stock['symbol']} Potential Breakout! Close: {candle['close']} > PDH: {pdh}")
+            logger.info(f"🔍 [SCAN] {symbol} crossed PDH ({pdh}). Checking Volume Matrix...")
             
-            # Validate Volume against the 10-level SMA Matrix
+            # Check Volume against Frontend Dashboard Settings
             is_qualified, detail = await BreakoutEngine.check_vol_matrix(stock, candle, 'bull', state)
             
             if is_qualified:
-                logger.info(f"✅ [QUALIFIED] {stock['symbol']} | {detail}")
+                logger.info(f"✅ [QUALIFIED] {symbol}: {detail}")
                 stock['status'] = 'TRIGGER_WATCH'
                 stock['side_latch'] = 'BULL'
-                # Set Trigger at High of Breakout Candle + Buffer
                 stock['trigger_px'] = round(candle['high'] * 1.0005, 2)
             else:
-                logger.info(f"❌ [REJECTED] {stock['symbol']} | {detail}")
+                # DETAILED LOGGING: Tells exactly why the stock failed
+                logger.info(f"❌ [REJECTED] {symbol}: {detail}")
+        
+        # Extra debug: If candle closed above PDH but didn't open below it (Gap Up case)
+        elif candle['close'] > pdh:
+             pass # Logic specifically requires crossing FROM below
 
     @staticmethod
     async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict):
         """
-        Asynchronously checks if the candle volume matches the SMA Tier settings.
+        Validates volume against the 10-tier matrix received from Frontend.
         """
         matrix = state["config"][side].get('volume_criteria', [])
         c_vol = candle['volume']
-        s_sma = stock.get('sma', 0) # Historical 20-Day SMA
+        s_sma = stock.get('sma', 0) 
         c_val_cr = (c_vol * candle['close']) / 10000000.0 # Turnover in Crores
+        symbol = stock['symbol']
 
         if not matrix:
-            return True, "No Volume Matrix defined (Auto-Pass)"
+            return True, "Volume Matrix empty in settings. Auto-passing."
 
-        # Search for the applicable Tier in the 10-level matrix
+        # Find applicable tier based on Stock's 20-Day SMA
         tier_found = None
         for i, level in enumerate(matrix):
-            min_sma = float(level.get('min_sma_avg', 0))
-            if s_sma >= min_sma:
+            # Settings received from Frontend Dashboard
+            min_sma_required = float(level.get('min_sma_avg', 0))
+            
+            if s_sma >= min_sma_required:
                 tier_found = (i, level)
             else:
-                break # Matrix is sorted by Min SMA
+                # Matrix is usually sorted; if SMA is lower than this tier, stop searching
+                break 
 
         if tier_found:
             idx, level = tier_found
-            mult = float(level.get('sma_multiplier', 1.0))
+            multiplier = float(level.get('sma_multiplier', 1.0))
             min_cr = float(level.get('min_vol_price_cr', 0))
-            target_vol = s_sma * mult
             
-            if c_vol >= target_vol and c_val_cr >= min_cr:
-                return True, f"L{idx+1} Match: Vol {c_vol:,.0f} > {target_vol:,.0f} (SMA {s_sma:,.0f} * {mult}) | Value {c_val_cr:.2f}Cr >= {min_cr}Cr"
-            else:
-                return False, f"L{idx+1} Fail: Vol {c_vol:,.0f}/{target_vol:,.0f} or Value {c_val_cr:.2f}Cr/{min_cr}Cr"
+            # Calculated Requirement
+            required_vol = s_sma * multiplier
+            
+            # Step-by-Step Validation Logs
+            if c_vol < required_vol:
+                return False, f"Tier {idx+1} Fail: Candle Vol {c_vol:,.0f} < Required {required_vol:,.0f} (SMA {s_sma:,.0f} * Mult {multiplier})"
+            
+            if c_val_cr < min_cr:
+                return False, f"Tier {idx+1} Fail: Turnover {c_val_cr:.2f}Cr < Min Required {min_cr}Cr"
+
+            return True, f"Tier {idx+1} Pass: Vol {c_vol:,.0f} > {required_vol:,.0f} | Turnover {c_val_cr:.2f}Cr"
         
-        return False, f"Stock SMA {s_sma:,.0f} too low for Matrix Tiers"
+        return False, f"SMA {s_sma:,.0f} is below all defined Matrix Tiers."
 
     @staticmethod
     async def open_trade(token: int, stock: dict, ltp: float, state: dict):
         """
-        Executes the trade entry. Checks Redis limits first.
+        Executes trade using Dashboard risk settings.
         """
         side = stock['side_latch'].lower()
         cfg = state["config"][side]
+        symbol = stock['symbol']
         
-        # ASYNC CHECK: Daily trade limit in Redis
-        if not await TradeControl.can_trade(side, int(cfg.get('total_trades', 5))):
-            logger.warning(f"🚫 [LIMIT] {side.upper()} Engine daily limit reached. Skipping {stock['symbol']}.")
+        # 1. Check Redis for daily limit
+        daily_limit = int(cfg.get('total_trades', 5))
+        if not await TradeControl.can_trade(side, daily_limit):
+            logger.warning(f"🚫 [LIMIT] {symbol}: Daily limit of {daily_limit} trades reached for {side}.")
             stock['status'] = 'WAITING'
             return
 
-        # Calculate Stop Loss (Low of breakout candle)
+        # 2. Calculate Risk based on Dashboard Settings
         sl_px = stock['candle']['low']
         risk_per_share = abs(ltp - sl_px)
-        if risk_per_share < (ltp * 0.001): risk_per_share = ltp * 0.005 # Safety floor
+        
+        # Safety: Ensure risk isn't 0
+        if risk_per_share <= 0: risk_per_share = ltp * 0.002 
 
-        # Position Sizing
-        total_risk = float(cfg.get('risk_trade_1', 2000))
-        qty = floor(total_risk / risk_per_share)
+        # Dashboard Setting: Risk per Trade
+        risk_amount = float(cfg.get('risk_trade_1', 2000))
+        qty = floor(risk_amount / risk_per_share)
         
         if qty <= 0:
-            logger.error(f"⚠️ [SIZE] Qty 0 for {stock['symbol']}. Risk too high?")
+            logger.error(f"❌ [SIZE ERROR] {symbol}: Risk/Share {risk_per_share:.2f} too high for ₹{risk_amount} risk limit.")
             stock['status'] = 'WAITING'
             return
 
-        # Target Calculation (R:R)
-        rr_val = float(cfg.get('risk_reward', "1:2").split(':')[-1])
-        target_px = round(ltp + (risk_per_share * rr_val), 2)
+        # Dashboard Setting: Risk Reward Ratio
+        # e.g., "1:2" -> extracts 2
+        try:
+            rr_str = cfg.get('risk_reward', "1:2")
+            rr_mult = float(rr_str.split(':')[-1])
+        except:
+            rr_mult = 2.0
 
-        # Update State
+        target_px = round(ltp + (risk_per_share * rr_mult), 2)
+
+        # 3. Commit Trade to State
         trade = {
-            "symbol": stock['symbol'],
+            "symbol": symbol,
             "qty": qty,
             "entry_price": ltp,
             "sl_price": sl_px,
@@ -169,13 +197,12 @@ class BreakoutEngine:
         stock['status'] = 'OPEN'
         stock['active_trade'] = trade
         
-        logger.info(f"🚀 [ENTRY] {stock['symbol']} @ {ltp} | Qty: {qty} | SL: {sl_px} | Tgt: {target_px}")
+        logger.info(f"🚀 [ENTRY] {symbol} @ {ltp} | Qty: {qty} | SL: {sl_px} | Tgt: {target_px} (RR {rr_mult})")
 
     @staticmethod
     async def monitor_active_trade(stock: dict, ltp: float, state: dict):
         """
-        Monitors every tick for an open position.
-        Handles Target, SL, and Trailing SL.
+        Real-time PnL and Exit monitoring.
         """
         trade = stock.get('active_trade')
         if not trade: return
@@ -183,49 +210,48 @@ class BreakoutEngine:
         side = stock['side_latch'].lower()
         cfg = state["config"][side]
 
-        # Update Unrealized PnL
-        trade['pnl'] = (ltp - trade['entry_price']) * trade['qty']
+        # Update PnL
+        trade['pnl'] = round((ltp - trade['entry_price']) * trade['qty'], 2)
 
-        # 1. CHECK TARGET
+        # 1. Target Hit
         if ltp >= trade['target_price']:
-            logger.info(f"🎯 [TARGET] {stock['symbol']} Exit @ {ltp}. PnL: +₹{trade['pnl']:.2f}")
+            logger.info(f"🎯 [TARGET] {stock['symbol']} hit {trade['target_price']}. PnL: +₹{trade['pnl']}")
             await BreakoutEngine.close_position(stock, state, "TARGET")
 
-        # 2. CHECK STOP LOSS
+        # 2. Stop Loss Hit
         elif ltp <= trade['sl_price']:
-            logger.info(f"🛑 [STOPLOSS] {stock['symbol']} Exit @ {ltp}. PnL: ₹{trade['pnl']:.2f}")
+            logger.info(f"🛑 [STOPLOSS] {stock['symbol']} hit {trade['sl_price']}. PnL: ₹{trade['pnl']}")
             await BreakoutEngine.close_position(stock, state, "SL")
 
-        # 3. TRAILING STOP LOSS (TSL)
+        # 3. Trailing Stop Loss (TSL) from Dashboard
         else:
-            tsl_ratio = float(cfg.get('trailing_sl', "1:1.5").split(':')[-1])
-            new_sl = await BreakoutEngine.calculate_tsl(trade, ltp, tsl_ratio)
-            if new_sl > trade['sl_price']:
-                trade['sl_price'] = new_sl
+            tsl_cfg = cfg.get('trailing_sl', "1:1.5")
+            try:
+                tsl_ratio = float(tsl_cfg.split(':')[-1])
+                new_sl = await BreakoutEngine.calculate_tsl(trade, ltp, tsl_ratio)
+                if new_sl > trade['sl_price']:
+                    trade['sl_price'] = new_sl
+                    # Log TSL move occasionally, not every tick
+            except: pass
 
-        # 4. MANUAL EXIT FROM DASHBOARD
+        # 4. Manual Dashboard Exit
         if stock['symbol'] in state['manual_exits']:
-            logger.info(f"🖱️ [MANUAL EXIT] Closing {stock['symbol']} as per user command.")
+            logger.info(f"🖱️ [MANUAL EXIT] User closed {stock['symbol']} via Dashboard.")
             await BreakoutEngine.close_position(stock, state, "MANUAL")
             state['manual_exits'].remove(stock['symbol'])
 
     @staticmethod
     async def calculate_tsl(trade: dict, ltp: float, ratio: float):
-        """Moves Stop Loss up as the trade moves into profit."""
         entry = trade['entry_price']
         risk = entry - trade['sl_price']
         profit = ltp - entry
-        
-        # If profit exceeds 'Ratio' times the Risk, trail the SL
         if profit > (risk * ratio):
-            # Trail by keeping original risk distance from current price
-            return round(ltp - risk, 2)
+            return round(ltp - (risk * 0.8), 2) # Trail up but keep some room
         return trade['sl_price']
 
     @staticmethod
     async def close_position(stock: dict, state: dict, reason: str):
-        """Final cleanup for a trade."""
-        # Reset stock status
+        symbol = stock['symbol']
         stock['status'] = 'WAITING'
         stock['active_trade'] = None
-        logger.info(f"🏁 [CLOSED] {stock['symbol']} | Reason: {reason}")
+        logger.info(f"🏁 [CLOSED] {symbol} | Reason: {reason}")
