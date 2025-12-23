@@ -58,7 +58,6 @@ app.add_middleware(
 )
 
 # --- STOCK UNIVERSE ---
-# [USER: Please paste your dictionary of 500+ stocks here]
 STOCK_INDEX_MAPPING = {
     "RELIANCE": "NIFTY 50",
     "TCS": "NIFTY 50",
@@ -67,7 +66,7 @@ STOCK_INDEX_MAPPING = {
 
 # --- CONSOLIDATED RAM STATE ---
 RAM_STATE = {
-    "main_loop": None, # CRITICAL: Stores the reference to the FastAPI uvloop
+    "main_loop": None,
     "kite": None,
     "kws": None,
     "api_key": "",
@@ -90,12 +89,8 @@ RAM_STATE = {
     "manual_exits": set()
 }
 
-# --- CRITICAL FIX 2: ASYNC BRIDGE (THREAD TO UVLOOP) ---
+# --- ASYNC BRIDGE (THREAD TO UVLOOP) ---
 def on_ticks(ws, ticks):
-    """
-    Receives ticks from Kite's background thread and safely schedules 
-    them into the FastAPI main event loop.
-    """
     if not RAM_STATE["main_loop"]:
         return
 
@@ -105,12 +100,9 @@ def on_ticks(ws, ticks):
             ltp = tick['last_price']
             vol = tick.get('volume_traded', 0)
             
-            # 1. Update LTP in RAM immediately (Thread-safe reading)
             RAM_STATE["stocks"][token]['ltp'] = ltp
             
-            # 2. Forward to Engines inside the main Async Loop
             try:
-                # This function is the ONLY way to call async code from a thread
                 asyncio.run_coroutine_threadsafe(
                     BreakoutEngine.run(token, ltp, vol, RAM_STATE),
                     RAM_STATE["main_loop"]
@@ -119,17 +111,15 @@ def on_ticks(ws, ticks):
                     MomentumEngine.run(token, ltp, vol, RAM_STATE),
                     RAM_STATE["main_loop"]
                 )
-            except Exception as e:
-                # Silently catch bridge errors to maintain ticker stability
+            except Exception:
                 pass
 
 def on_connect(ws, response):
-    logger.info("✅ TICKER: Handshake successful. Subscribing to tokens...")
+    logger.info("✅ TICKER: Handshake successful.")
     tokens = list(RAM_STATE["stocks"].keys())
     if tokens:
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
-        logger.info(f"✅ TICKER: Subscribed to {len(tokens)} stocks in FULL mode.")
     RAM_STATE["data_connected"]["breakout"] = True
     RAM_STATE["data_connected"]["momentum"] = True
 
@@ -137,7 +127,7 @@ def on_error(ws, code, reason):
     logger.error(f"❌ TICKER ERROR: {code} - {reason}")
 
 def on_close(ws, code, reason):
-    logger.warning(f"⚠️ TICKER: Connection closed ({code}: {reason})")
+    logger.warning(f"⚠️ TICKER: Connection closed.")
     RAM_STATE["data_connected"]["breakout"] = False
     RAM_STATE["data_connected"]["momentum"] = False
 
@@ -146,26 +136,27 @@ def on_close(ws, code, reason):
 @app.on_event("startup")
 async def startup_event():
     logger.info("--- 🚀 NEXUS ASYNC ENGINE BOOTING ---")
-    
-    # CAPTURE THE RUNNING LOOP (The Fix for RuntimeError)
     RAM_STATE["main_loop"] = asyncio.get_running_loop()
     
-    # 1. Restore API Credentials from Redis
-    key, secret = await TradeControl.get_config()
-    token = await TradeControl.get_access_token()
-    
-    if key and secret:
-        RAM_STATE["api_key"], RAM_STATE["api_secret"] = key, secret
-        logger.info(f"🔑 REDIS: API Credentials Restored ({key[:4]}***)")
+    # 1. Restore API Credentials (Redis -> ENV)
+    key_redis, secret_redis = await TradeControl.get_config()
+    api_key = key_redis or os.getenv("KITE_API_KEY")
+    api_secret = secret_redis or os.getenv("KITE_API_SECRET")
 
-    if token and key:
+    if api_key and api_secret:
+        RAM_STATE["api_key"] = str(api_key)
+        RAM_STATE["api_secret"] = str(api_secret)
+        logger.info(f"🔑 Startup: Credentials restored ({RAM_STATE['api_key'][:4]}***)")
+
+    # 2. Attempt Session Restoration
+    token = await TradeControl.get_access_token()
+    if token and RAM_STATE["api_key"]:
         try:
-            RAM_STATE["access_token"] = token
-            RAM_STATE["kite"] = KiteConnect(api_key=key)
-            RAM_STATE["kite"].set_access_token(token)
+            RAM_STATE["access_token"] = str(token)
+            RAM_STATE["kite"] = KiteConnect(api_key=RAM_STATE["api_key"])
+            RAM_STATE["kite"].set_access_token(RAM_STATE["access_token"])
             
-            # 2. Map Instruments (Run blocking call in executor)
-            logger.info("📡 KITE: Mapping NSE Instruments...")
+            # Map Instruments
             instruments = await asyncio.to_thread(RAM_STATE["kite"].instruments, "NSE")
             for instr in instruments:
                 symbol = instr['tradingsymbol']
@@ -176,123 +167,93 @@ async def startup_event():
                         'hi': 0, 'lo': 0, 'pdh': 0, 'pdl': 0, 'sma': 0, 'candle': None, 'last_vol': 0
                     }
             
-            # 3. Fast-Boot: Hydrate Stock SMA/PDH from Redis Cache
-            cached_data = await TradeControl.get_all_market_data()
-            if cached_data:
-                logger.info(f"⚡ CACHE: Hydrating {len(cached_data)} stocks from market cache.")
-                for t_id_str, data in cached_data.items():
-                    t_id = int(t_id_str)
-                    if t_id in RAM_STATE["stocks"]:
-                        RAM_STATE["stocks"][t_id].update(data)
-            
-            # 4. Start Ticker (Threaded=True uses our patched reactor internally)
-            RAM_STATE["kws"] = KiteTicker(key, token)
+            # Start Ticker
+            RAM_STATE["kws"] = KiteTicker(RAM_STATE["api_key"], RAM_STATE["access_token"])
             RAM_STATE["kws"].on_ticks = on_ticks
             RAM_STATE["kws"].on_connect = on_connect
             RAM_STATE["kws"].on_error = on_error
             RAM_STATE["kws"].on_close = on_close
-            
-            # This runs Twisted in a background thread. Fix 1 prevents Signal errors.
             RAM_STATE["kws"].connect(threaded=True)
-            logger.info("🛰️ SYSTEM: Ticker initialized in background thread (Signal-Safe).")
+            logger.info("🛰️ Startup: Market data connection active.")
 
         except Exception as e:
-            logger.error(f"❌ STARTUP CRASH: {e}")
+            logger.error(f"❌ Startup Session Restore Failed: {e}")
 
 # --- WEB & API ENDPOINTS ---
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    with open("index.html", "r") as f: return f.read()
-
-@app.get("/api/stats")
-async def get_stats():
-    """Provides real-time stats for the Dashboard UI."""
-    total_pnl = 0.0
-    engine_stats = {}
-    for side in ["bull", "bear", "mom_bull", "mom_bear"]:
-        side_pnl = sum(t.get('pnl', 0) for t in RAM_STATE["trades"][side])
-        engine_stats[side] = side_pnl
-        total_pnl += side_pnl
-    
-    RAM_STATE["pnl"]["total"] = total_pnl
-    return {
-        "pnl": {**RAM_STATE["pnl"], **engine_stats},
-        "data_connected": RAM_STATE["data_connected"],
-        "engine_status": {k: ("1" if v else "0") for k, v in RAM_STATE["engine_live"].items()}
-    }
-
-@app.get("/api/orders")
-async def get_orders(): 
-    """Returns all active and closed trades for the current session."""
-    return RAM_STATE["trades"]
-
-@app.get("/api/scanner")
-async def get_scanner():
-    """Returns stocks that have generated a pre-trigger signal."""
-    signals = {side: [] for side in ["bull", "bear", "mom_bull", "mom_bear"]}
-    for t_id, s in RAM_STATE["stocks"].items():
-        if s.get('status') in ['TRIGGER_WATCH', 'MOM_TRIGGER_WATCH']:
-            side = s.get('side_latch', '').lower()
-            if side in signals:
-                signals[side].append({"symbol": s['symbol'], "price": s['trigger_px']})
-    return signals
-
-@app.post("/api/control")
-async def control_center(data: dict):
-    """Handles engine toggles and API credential saves."""
-    action = data.get("action")
-    if action == "save_api":
-        key, secret = data.get("api_key"), data.get("api_secret")
-        RAM_STATE["api_key"], RAM_STATE["api_secret"] = key, secret
-        await TradeControl.save_config(key, secret)
-        logger.info("💾 CONTROL: API credentials persisted to Redis.")
-    elif action == "get_saved_keys":
-        return {"api_key": RAM_STATE["api_key"], "api_secret": "********" if RAM_STATE["api_secret"] else ""}
-    elif action == "toggle_engine":
-        RAM_STATE["engine_live"][data['side']] = data['enabled']
-        logger.info(f"⚙️ CONTROL: Engine {data['side']} set to {data['enabled']}")
-    elif action == "manual_exit":
-        RAM_STATE["manual_exits"].add(data['symbol'])
-    return {"status": "ok"}
-
-@app.get("/api/settings/engine/{side}")
-async def get_engine_settings(side: str):
-    return RAM_STATE["config"].get(side, {})
-
-@app.post("/api/settings/engine/{side}")
-async def save_engine_settings(side: str, data: dict):
-    RAM_STATE["config"][side].update(data)
-    logger.info(f"📝 SETTINGS: Volume matrix updated for {side}.")
-    return {"status": "success"}
+    try:
+        with open("index.html", "r") as f: return f.read()
+    except: return "index.html not found."
 
 @app.get("/api/kite/login")
 async def kite_login_redirect():
     api_key = RAM_STATE["api_key"] or os.getenv("KITE_API_KEY")
-    if not api_key: return {"status": "error", "message": "Save API Key first."}
-    return RedirectResponse(url=KiteConnect(api_key=api_key).login_url())
+    if not api_key:
+        return {"status": "error", "message": "Save API credentials in settings first."}
+    
+    kite = KiteConnect(api_key=api_key)
+    return RedirectResponse(url=kite.login_url())
 
 @app.get("/login")
 async def kite_callback(request_token: str = None):
-    """The URL Zerodha redirects to after user login."""
+    """
+    FIX: Multi-layer credential check to prevent NoneType encode error.
+    """
+    if not request_token:
+        return {"status": "error", "message": "Request token missing"}
+
+    # Try Memory -> Then Env -> Then Redis
+    api_key = RAM_STATE["api_key"] or os.getenv("KITE_API_KEY")
+    api_secret = RAM_STATE["api_secret"] or os.getenv("KITE_API_SECRET")
+    
+    if not api_key or not api_secret:
+        key_r, sec_r = await TradeControl.get_config()
+        api_key = api_key or key_r
+        api_secret = api_secret or sec_r
+
+    # Validation
+    if not api_key or not api_secret:
+        return {"status": "error", "message": "API Key or Secret is null. Set them in Heroku Config Vars."}
+
     try:
-        api_key, api_secret = RAM_STATE["api_key"], RAM_STATE["api_secret"]
-        kite = KiteConnect(api_key=api_key)
-        data = await asyncio.to_thread(kite.generate_session, request_token, api_secret=api_secret)
+        # Cast to string is vital for the SDK's internal .encode()
+        kite = KiteConnect(api_key=str(api_key))
+        data = await asyncio.to_thread(
+            kite.generate_session, 
+            request_token, 
+            api_secret=str(api_secret)
+        )
         
         token = data["access_token"]
         await TradeControl.save_access_token(token)
-        logger.info("🔑 AUTH: Zerodha Session established. Access token saved.")
+        RAM_STATE["access_token"] = token
+        RAM_STATE["api_key"] = str(api_key)
+        RAM_STATE["api_secret"] = str(api_secret)
+        RAM_STATE["kite"] = kite
+        RAM_STATE["kite"].set_access_token(token)
         
+        logger.info("✅ Login Successful.")
         return RedirectResponse(url="/")
+
     except Exception as e:
-        logger.error(f"❌ AUTH ERROR: {e}")
+        logger.error(f"❌ AUTH ERROR: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# --- SERVER ENTRY POINT ---
+@app.post("/api/control")
+async def control_center(data: dict):
+    action = data.get("action")
+    if action == "save_api":
+        key, secret = data.get("api_key"), data.get("api_secret")
+        RAM_STATE["api_key"], RAM_STATE["api_secret"] = str(key), str(secret)
+        await TradeControl.save_config(key, secret)
+        return {"status": "ok"}
+    elif action == "toggle_engine":
+        RAM_STATE["engine_live"][data['side']] = data['enabled']
+        return {"status": "ok"}
+    return {"status": "error"}
 
 if __name__ == "__main__":
-    # Get port from Heroku environment
     port = int(os.environ.get("PORT", 8000))
-    # CRITICAL: Use workers=1 to prevent multiple WebSocket connections
     uvicorn.run("main:app", host="0.0.0.0", port=port, loop="uvloop", workers=1)
