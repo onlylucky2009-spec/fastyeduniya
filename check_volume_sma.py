@@ -5,7 +5,7 @@ import os
 # --- Configuration ---
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 HASH_KEY = 'nexus:market_cache'
-SMA_THRESHOLD = 1000
+SMA_THRESHOLD = 500
 
 def filter_high_volume_stocks():
     """
