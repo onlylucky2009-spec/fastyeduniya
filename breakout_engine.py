@@ -146,6 +146,7 @@ class BreakoutEngine:
         pdl = float(stock.get("pdl", 0) or 0)
         if pdh <= 0 or pdl <= 0:
             return
+        c_open = float(candle.get("open", 0))
 
         high = float(candle.get("high", 0) or 0)
         low = float(candle.get("low", 0) or 0)
@@ -157,7 +158,7 @@ class BreakoutEngine:
         now = datetime.now(IST)
 
         # --- BULL BREAKOUT ---
-        if close > pdh:
+        if close > pdh and c_open < pdh:
             side = "bull"
 
             if not bool(state["engine_live"].get(side, True)):
@@ -193,7 +194,7 @@ class BreakoutEngine:
             return
 
         # --- BEAR BREAKDOWN ---
-        if close < pdl:
+        if close < pdl and c_open>pdl:
             side = "bear"
 
             if not bool(state["engine_live"].get(side, True)):
