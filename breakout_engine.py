@@ -368,19 +368,19 @@ class BreakoutEngine:
         """
         # 1. Range Check: Candle ki body aur wicks bohot badi nahi honi chahiye
         range_pct = ((high - low) / close) * 100.0
-        if range_pct > 0.7:
+        if range_pct > 2:
             logger.warning(f"🚫 Range rejected: {range_pct:.2f}% (Limit: 0.7%)")
             return False
         
         # 2. Gap Check: Breakout point PDH/PDL se bohot door nahi hona chahiye
         if side == "bull":
             gap = ((high - pdh) / pdh) * 100.0
-            if gap > 0.5:
+            if gap > 1:
                 logger.warning(f"🚫 Bull Gap rejected: {gap:.2f}% (Limit: 0.5%)")
                 return False
         else:
             gap = ((pdl - low) / pdl) * 100.0
-            if gap > 0.5:
+            if gap > 1:
                 logger.warning(f"🚫 Bear Gap rejected: {gap:.2f}% (Limit: 0.5%)")
                 return False
 
