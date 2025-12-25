@@ -5,7 +5,7 @@ import os
 # --- Configuration ---
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 HASH_KEY = 'nexus:market_cache'
-SMA_THRESHOLD = 1000
+SMA_THRESHOLD = 100
 
 def filter_high_volume_stocks():
     """
@@ -41,7 +41,7 @@ def filter_high_volume_stocks():
                 sma_value = data.get('sma', 0)
                 symbol = data.get('symbol', 'Unknown')
                 
-                if sma_value < SMA_THRESHOLD:
+                if sma_value > SMA_THRESHOLD:
                     count += 1
                     high_sma_stocks.append({
                         "symbol": symbol,
