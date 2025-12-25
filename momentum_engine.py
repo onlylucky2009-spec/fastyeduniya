@@ -1,7 +1,7 @@
 # momentum_engine.py
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, time as dtime
 from math import floor
 from typing import Optional, Tuple
 import pytz
@@ -14,47 +14,49 @@ IST = pytz.timezone("Asia/Kolkata")
 
 class MomentumEngine:
     """
-    Momentum Engine (mom_bull / mom_bear) — Parallel-safe
+    ENTRY LOGIC (FIRST CANDLE + GAP + VOLUME MATRIX OR):
 
-    ✅ Parallel + non-blocking ready:
-      - Engine only touches mom_* keys (no collisions with Breakout)
-      - run() is tick-fast (no candle aggregation here)
-      - on_candle_close() is called by main.py candle_close_worker
-      - Per-symbol atomic lock + daily cap via Redis (TradeControl helpers)
-      - Side-level trade cap (mom_bull/mom_bear) via Redis reserve_side_trade
-      - Rollback-safe reservations (if order fails)
-      - Direction safety: mom_bull -> BUY, mom_bear -> SELL (hard-mapped)
-      - Trade records never removed; marked CLOSED so PnL stays correct
-      - Detailed logs for debugging missed ticks / wrong direction
+    ✅ Only 1 candle matters: FIRST 1-minute candle of the day (09:15 -> 09:16 IST)
+    ✅ After that candle closes:
+        - If LTP breaks FIRST candle HIGH  -> LONG (mom_bull)
+        - If LTP breaks FIRST candle LOW   -> SHORT (mom_bear)
 
-    Required RedisManager methods:
-      - reserve_side_trade(side, limit) -> bool
-      - rollback_side_trade(side) -> bool
-      - reserve_symbol_trade(symbol, max_trades=2, lock_ttl_sec=...) -> (bool, reason)
-      - rollback_symbol_trade(symbol) -> bool
-      - release_symbol_lock(symbol) -> bool
-      - get_symbol_trade_count(symbol) -> int
+    ✅ Gap filter (absolute):
+        abs((first_close - prev_close) / prev_close) * 100 <= 3.0
+
+    ✅ Volume Matrix filter (OR MODE ONLY):
+        - Evaluated on the FIRST candle itself (volume + close)
+        - SAME schema:
+            min_vol_price_cr, sma_multiplier, min_sma_avg
+        - OR means: ANY applicable row passing => PASS
+
+    ✅ Exit conditions as per frontend settings:
+        - risk_reward, trailing_sl, risk_trade_1
+
+    ✅ Stoploss NOT candle-low/high:
+        - Uses configurable % SL from entry (cfg["sl_pct"] if present else 0.5%)
+
+    Notes:
+    - Candle aggregation MUST be centralized in main.py and call on_candle_close().
+    - Candle dict must contain "bucket" as datetime (or ISO string) for 09:15 detection.
     """
 
     EXIT_BUFFER_PCT = 0.0001
     MAX_TRADES_PER_SYMBOL = 2
 
+    DEFAULT_SL_PCT = 0.005  # 0.5%
+    FIRST_CANDLE_TIME = dtime(9, 15)
+
     # -----------------------------
-    # TICK FAST-PATH (called each tick)
+    # TICK FAST-PATH
     # -----------------------------
     @staticmethod
     async def run(token: int, ltp: float, vol: int, state: dict):
-        """
-        Tick handler
-          - Monitors MOM_OPEN
-          - Monitors MOM_TRIGGER_WATCH for entry
-          - Does NOT aggregate candles (main.py does that centrally)
-        """
         stock = state["stocks"].get(token)
         if not stock:
             return
 
-        symbol = stock.get("symbol") or ""
+        symbol = (stock.get("symbol") or "").strip().upper()
         if not symbol:
             return
 
@@ -62,231 +64,219 @@ class MomentumEngine:
 
         mom_status = (stock.get("mom_status") or "WAITING").upper()
 
-        # 1) Always monitor open trade (even if engine toggle off)
+        # 1) Always monitor open trade (even if toggle off)
         if mom_status == "OPEN":
-            await MomentumEngine.monitor_active_trade(stock, ltp, state)
+            await MomentumEngine.monitor_active_trade(stock, float(ltp), state)
             return
 
-        # 2) Trigger watch -> enter if break happens (gates)
+        # 2) Trigger watch -> break FIRST candle high/low
         if mom_status == "TRIGGER_WATCH":
-            side = (stock.get("mom_side_latch") or "").lower()
-            if side not in ("mom_bull", "mom_bear"):
-                logger.warning(f"[MOM] {symbol} invalid mom_side_latch; resetting.")
+            th = float(stock.get("mom_trigger_high", 0.0) or 0.0)
+            tl = float(stock.get("mom_trigger_low", 0.0) or 0.0)
+            if th <= 0 or tl <= 0:
+                return
+
+            cfg_bull = state["config"].get("mom_bull", {}) or {}
+            cfg_bear = state["config"].get("mom_bear", {}) or {}
+
+            in_bull_window = MomentumEngine._within_trade_window(cfg_bull)
+            in_bear_window = MomentumEngine._within_trade_window(cfg_bear)
+
+            if not (in_bull_window or in_bear_window):
+                logger.info(f"🕒 [MOM-WINDOW] {symbol} outside both windows; reset.")
                 MomentumEngine._reset_waiting(stock)
                 return
 
-            # Engine toggle gates new entry only
-            if not bool(state["engine_live"].get(side, True)):
+            px = float(ltp)
+
+            # Break high => LONG
+            if px > th:
+                if not bool(state["engine_live"].get("mom_bull", True)):
+                    return
+                if not in_bull_window:
+                    return
+                logger.info(f"⚡ [MOM-FIRST-BREAK] {symbol} LONG ltp {px:.2f} > first_high {th:.2f}")
+                await MomentumEngine.open_trade(stock, px, state, "mom_bull")
                 return
 
-            # Trade window gate
-            if not MomentumEngine._within_trade_window(state["config"].get(side, {})):
-                logger.info(f"🕒 [MOM-WINDOW] {symbol} {side.upper()} outside trade window; reset.")
-                MomentumEngine._reset_waiting(stock)
+            # Break low => SHORT
+            if px < tl:
+                if not bool(state["engine_live"].get("mom_bear", True)):
+                    return
+                if not in_bear_window:
+                    return
+                logger.info(f"⚡ [MOM-FIRST-BREAK] {symbol} SHORT ltp {px:.2f} < first_low {tl:.2f}")
+                await MomentumEngine.open_trade(stock, px, state, "mom_bear")
                 return
 
-            trig = float(stock.get("mom_trigger_px", 0.0) or 0.0)
-            if trig <= 0:
-                MomentumEngine._reset_waiting(stock)
-                return
-
-            if side == "mom_bull":
-                if float(ltp) > trig:
-                    logger.info(f"⚡ [MOM-TRIGGER] {symbol} MOM_BULL ltp {ltp:.2f} > {trig:.2f}")
-                    await MomentumEngine.open_trade(stock, float(ltp), state, "mom_bull")
-            else:
-                if float(ltp) < trig:
-                    logger.info(f"⚡ [MOM-TRIGGER] {symbol} MOM_BEAR ltp {ltp:.2f} < {trig:.2f}")
-                    await MomentumEngine.open_trade(stock, float(ltp), state, "mom_bear")
-            return
-
-        # WAITING: nothing to do in tick path
         return
 
     # -----------------------------
-    # CANDLE CLOSE QUALIFICATION (called by main.py)
+    # CANDLE CLOSE (only FIRST candle)
     # -----------------------------
     @staticmethod
     async def on_candle_close(token: int, candle: dict, state: dict):
-        """
-        Momentum qualification rule:
-          - mom_bull: candle close > PDH
-          - mom_bear: candle close < PDL
-        plus volume matrix filter.
-        """
         stock = state["stocks"].get(token)
         if not stock:
             return
 
-        symbol = stock.get("symbol") or ""
+        symbol = (stock.get("symbol") or "").strip().upper()
         if not symbol:
             return
 
-        # Do not qualify if momentum already busy
-        if (stock.get("mom_status") or "WAITING").upper() in ("OPEN", "TRIGGER_WATCH"):
+        # if already open, do nothing
+        if (stock.get("mom_status") or "WAITING").upper() == "OPEN":
             return
 
-        # Per-symbol cap check (Redis)
-        try:
-            taken = await TradeControl.get_symbol_trade_count(symbol)
-            if int(taken) >= MomentumEngine.MAX_TRADES_PER_SYMBOL:
-                return
-        except Exception as e:
-            logger.warning(f"[MOM] {symbol} trade_count check failed: {e}")
+        # Already captured first candle today?
+        today = datetime.now(IST).strftime("%Y%m%d")
+        if str(stock.get("mom_first_day") or "") == today:
+            return
 
-        pdh = float(stock.get("pdh", 0) or 0)
-        pdl = float(stock.get("pdl", 0) or 0)
-        if pdh <= 0 or pdl <= 0:
+        # Identify candle bucket time
+        bucket = candle.get("bucket")
+        bucket_dt: Optional[datetime] = None
+        try:
+            if isinstance(bucket, datetime):
+                bucket_dt = bucket.astimezone(IST) if bucket.tzinfo else bucket.replace(tzinfo=IST)
+            elif isinstance(bucket, str) and bucket:
+                bucket_dt = datetime.fromisoformat(bucket.replace("Z", "+00:00")).astimezone(IST)
+        except Exception:
+            bucket_dt = None
+
+        if bucket_dt is None:
+            return
+
+        # Only first candle bucket 09:15
+        if bucket_dt.time() != MomentumEngine.FIRST_CANDLE_TIME:
             return
 
         high = float(candle.get("high", 0) or 0)
         low = float(candle.get("low", 0) or 0)
         close = float(candle.get("close", 0) or 0)
         c_vol = int(candle.get("volume", 0) or 0)
-        if close <= 0 or high <= 0 or low <= 0:
+
+        if high <= 0 or low <= 0 or close <= 0:
             return
 
-        now = datetime.now(IST)
-
-        # MOM BULL
-        if close > pdh:
-            side = "mom_bull"
-            if not bool(state["engine_live"].get(side, True)):
-                logger.debug(f"[MOM] {symbol} mom_bull OFF; skip qualify")
-                return
-
-            if not MomentumEngine._within_trade_window(state["config"].get(side, {}), now=now):
-                return
-
-            ok, detail = await MomentumEngine.check_vol_matrix(stock, candle, side, state)
-            if not ok:
-                logger.info(f"❌ [MOM-REJECT] {symbol} MOM_BULL | {detail}")
-                return
-
-            stock["mom_status"] = "TRIGGER_WATCH"
-            stock["mom_side_latch"] = "mom_bull"
-            stock["mom_trigger_px"] = float(high)
-            stock["mom_trigger_candle"] = dict(candle)
-
-            stock["mom_scan_vol"] = int(c_vol)
-            stock["mom_scan_reason"] = f"Momentum bull + Vol OK ({detail})"
-            stock["mom_scan_seen_ts"] = None
-            stock["mom_scan_seen_time"] = None
-
-            logger.info(f"✅ [MOM-QUALIFIED] {symbol} MOM_BULL trigger@{high:.2f} {detail}")
+        prev_close = float(stock.get("prev_close", 0) or 0)
+        if prev_close <= 0:
+            logger.warning(f"⚠️ [MOM-FIRST] {symbol} prev_close missing/0. Check Redis nexus:market:*")
             return
 
-        # MOM BEAR
-        if close < pdl:
-            side = "mom_bear"
-            if not bool(state["engine_live"].get(side, True)):
-                logger.debug(f"[MOM] {symbol} mom_bear OFF; skip qualify")
-                return
-
-            if not MomentumEngine._within_trade_window(state["config"].get(side, {}), now=now):
-                return
-
-            ok, detail = await MomentumEngine.check_vol_matrix(stock, candle, side, state)
-            if not ok:
-                logger.info(f"❌ [MOM-REJECT] {symbol} MOM_BEAR | {detail}")
-                return
-
-            stock["mom_status"] = "TRIGGER_WATCH"
-            stock["mom_side_latch"] = "mom_bear"
-            stock["mom_trigger_px"] = float(low)
-            stock["mom_trigger_candle"] = dict(candle)
-
-            stock["mom_scan_vol"] = int(c_vol)
-            stock["mom_scan_reason"] = f"Momentum bear + Vol OK ({detail})"
-            stock["mom_scan_seen_ts"] = None
-            stock["mom_scan_seen_time"] = None
-
-            logger.info(f"✅ [MOM-QUALIFIED] {symbol} MOM_BEAR trigger@{low:.2f} {detail}")
+        # gap filter
+        gap_pct = abs((close - prev_close) / prev_close) * 100.0
+        if gap_pct > 3.0:
+            stock["mom_first_day"] = today
+            stock["mom_status"] = "WAITING"
+            stock["mom_skip_today"] = True
+            stock["mom_skip_reason"] = f"Gap {gap_pct:.2f}% > 3%"
+            logger.info(f"🚫 [MOM-FIRST-SKIP] {symbol} gap={gap_pct:.2f}% (close={close:.2f}, prev={prev_close:.2f})")
             return
+
+        # Per-symbol cap check (Redis)
+        try:
+            taken = await TradeControl.get_symbol_trade_count(symbol)
+            if int(taken) >= MomentumEngine.MAX_TRADES_PER_SYMBOL:
+                stock["mom_first_day"] = today
+                return
+        except Exception as e:
+            logger.warning(f"[MOM] {symbol} trade_count check failed: {e}")
+
+        # -------- Volume Matrix filter (OR mode only) --------
+        # Use mom_bull config for matrix, else fallback mom_bear
+        cfg_for_matrix = state["config"].get("mom_bull", {}) or state["config"].get("mom_bear", {}) or {}
+        ok, detail = MomentumEngine.check_vol_matrix_or(stock=stock, candle=candle, cfg=cfg_for_matrix)
+        if not ok:
+            stock["mom_first_day"] = today  # prevent repeated checks
+            stock["mom_status"] = "WAITING"
+            stock["mom_skip_today"] = True
+            stock["mom_skip_reason"] = f"Matrix fail: {detail}"
+            logger.info(f"❌ [MOM-FIRST-REJECT] {symbol} Matrix fail: {detail}")
+            return
+
+        # Store first candle triggers
+        stock["mom_first_day"] = today
+        stock["mom_first_candle"] = dict(candle)
+        stock["mom_trigger_high"] = float(high)
+        stock["mom_trigger_low"] = float(low)
+
+        stock["mom_status"] = "TRIGGER_WATCH"
+
+        # Scanner enrichment
+        stock["mom_scan_vol"] = int(c_vol)
+        stock["mom_scan_reason"] = f"First 1m breakout watch | gap={gap_pct:.2f}% | {detail}"
+        stock["mom_scan_seen_ts"] = None
+        stock["mom_scan_seen_time"] = None
+
+        logger.info(
+            f"✅ [MOM-FIRST-SET] {symbol} high={high:.2f} low={low:.2f} close={close:.2f} "
+            f"prev={prev_close:.2f} gap={gap_pct:.2f}% | {detail}"
+        )
 
     # -----------------------------
-    # VOLUME MATRIX (same schema)
+    # VOLUME MATRIX (OR MODE ONLY)
     # -----------------------------
-    # @staticmethod
-    # async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict) -> Tuple[bool, str]:
-    #     cfg = state["config"].get(side, {}) or {}
-    #     matrix = cfg.get("volume_criteria", []) or []
-
-    #     c_vol = int(candle.get("volume", 0) or 0)
-    #     s_sma = float(stock.get("sma", 0) or 0)
-    #     close = float(candle.get("close", 0) or 0)
-    #     c_val_cr = (c_vol * close) / 10000000.0 if close > 0 else 0.0
-
-    #     if not matrix:
-    #         return True, "NoMatrix"
-
-    #     tier_found = None
-    #     for i, level in enumerate(matrix):
-    #         try:
-    #             min_sma_avg = float(level.get("min_sma_avg", 0) or 0)
-    #         except Exception:
-    #             min_sma_avg = 0.0
-
-    #         if s_sma >= min_sma_avg:
-    #             tier_found = (i, level)
-    #         else:
-    #             break
-
-    #     if not tier_found:
-    #         return False, f"SMA {s_sma:,.0f} too low"
-
-    #     idx, level = tier_found
-    #     required_vol = s_sma * float(level.get("sma_multiplier", 1.0) or 1.0)
-    #     min_cr = float(level.get("min_vol_price_cr", 0) or 0)
-
-    #     if c_vol >= required_vol and c_val_cr >= min_cr:
-    #         return True, f"Tier{idx+1}Pass"
-    #     return False, f"Tier{idx+1}Fail (Vol/Value)"
     @staticmethod
-    async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict):
-        cfg = state["config"].get(side, {})
-        matrix = cfg.get("volume_criteria", []) or []
-
-        c_vol = int(candle.get("volume", 0) or 0)
-        s_sma = float(stock.get("sma", 0) or 0)
-        close = float(candle.get("close", 0) or 0)
-
-        turnover_cr = (c_vol * close) / 10000000.0 if close > 0 else 0.0
-
+    def check_vol_matrix_or(stock: dict, candle: dict, cfg: dict) -> Tuple[bool, str]:
+        """
+        OR MODE ONLY:
+          - ANY applicable row passing => PASS
+          - Applicable row: SMA >= min_sma_avg
+          - Conditions:
+              candle_vol >= SMA * sma_multiplier
+              turnover_cr >= min_vol_price_cr
+        """
+        matrix = (cfg.get("volume_criteria") or []) if isinstance(cfg, dict) else []
         if not matrix:
             return True, "NoMatrix"
 
-        # ✅ OR logic: any row can pass
+        c_vol = int(candle.get("volume", 0) or 0)
+        close = float(candle.get("close", 0) or 0)
+        s_sma = float(stock.get("sma", 0) or 0)
+
+        if close <= 0 or c_vol <= 0:
+            return False, "BadCandleVol/Close"
+
+        turnover_cr = (c_vol * close) / 10000000.0
+
         best_fail = None
-        for i, level in enumerate(matrix):
+        any_applicable = False
+
+        for i, row in enumerate(matrix):
+            if not isinstance(row, dict):
+                continue
+
             try:
-                min_sma_avg = float(level.get("min_sma_avg", 0) or 0)
-                sma_mult = float(level.get("sma_multiplier", 1.0) or 1.0)
-                min_cr = float(level.get("min_vol_price_cr", 0) or 0)
+                min_sma_avg = float(row.get("min_sma_avg", 0) or 0)
+                sma_mult = float(row.get("sma_multiplier", 1.0) or 1.0)
+                min_cr = float(row.get("min_vol_price_cr", 0) or 0)
             except Exception:
                 continue
 
-            # rule applicable only if SMA >= min_sma_avg
+            # applicable only if SMA >= min_sma_avg
             if s_sma < min_sma_avg:
-                best_fail = best_fail or f"L{i+1} skip (SMA<{min_sma_avg})"
                 continue
 
-            required_vol = s_sma * sma_mult
+            any_applicable = True
+            req_vol = s_sma * sma_mult
 
-            if (c_vol >= required_vol) and (turnover_cr >= min_cr):
+            if (c_vol >= req_vol) and (turnover_cr >= min_cr):
                 return True, f"L{i+1} Pass (OR)"
 
-            # keep some useful fail reason for logs
-            best_fail = f"L{i+1} Fail (vol {c_vol}<{required_vol:.0f} or cr {turnover_cr:.2f}<{min_cr})"
+            best_fail = f"L{i+1} Fail (vol {c_vol}<{req_vol:.0f} or cr {turnover_cr:.2f}<{min_cr})"
 
-        return False, best_fail or "NoRuleMatched"
+        if not any_applicable:
+            return False, f"NoApplicableRows (SMA={s_sma:.0f})"
+
+        return False, best_fail or "NoRowPassed (OR)"
 
     # -----------------------------
     # OPEN TRADE (direction-safe + reservation-safe)
     # -----------------------------
     @staticmethod
     async def open_trade(stock: dict, ltp: float, state: dict, side_key: str):
-        symbol = stock.get("symbol") or ""
+        symbol = (stock.get("symbol") or "").strip().upper()
         if not symbol:
             MomentumEngine._reset_waiting(stock)
             return
@@ -305,82 +295,74 @@ class MomentumEngine:
             return
 
         if not bool(state["engine_live"].get(side_key, True)):
-            logger.info(f"[MOM] {symbol} {side_key} engine OFF at entry; reset")
             MomentumEngine._reset_waiting(stock)
             return
 
         if not MomentumEngine._within_trade_window(cfg):
-            logger.info(f"[MOM] {symbol} {side_key} outside window at entry; reset")
             MomentumEngine._reset_waiting(stock)
             return
 
-        # ✅ Direction hard-map (prevents wrong BUY/SELL)
+        # ✅ Direction hard-map
         txn_type = kite.TRANSACTION_TYPE_BUY if side_key == "mom_bull" else kite.TRANSACTION_TYPE_SELL
 
-        # -------------------- reservations (atomic) --------------------
+        # 1) reserve side trade
         side_limit = int(cfg.get("total_trades", 5) or 5)
-
-        # 1) reserve side trade (mom_bull/mom_bear) with cap
         if not await TradeControl.reserve_side_trade(side_key, side_limit):
             logger.warning(f"🚫 [MOM-LIMIT] {symbol} side limit hit for {side_key}")
             MomentumEngine._reset_waiting(stock)
             return
 
-        # 2) reserve per-symbol lock + daily count (2/day, 2nd only after close)
-        ok, reason = await TradeControl.reserve_symbol_trade(symbol, max_trades=MomentumEngine.MAX_TRADES_PER_SYMBOL)
+        # 2) reserve per-symbol
+        ok, reason = await TradeControl.reserve_symbol_trade(
+            symbol,
+            max_trades=MomentumEngine.MAX_TRADES_PER_SYMBOL,
+            lock_ttl_sec=1800,
+        )
         if not ok:
             logger.warning(f"🚫 [MOM-SYMBOL] {symbol} reserve failed: {reason}")
             await TradeControl.rollback_side_trade(side_key)
             MomentumEngine._reset_waiting(stock)
             return
 
-        # SL derived from trigger candle opposite extreme
-        trig_candle = stock.get("mom_trigger_candle") or {}
+        # Stoploss: percent based
+        try:
+            sl_pct = float(cfg.get("sl_pct", MomentumEngine.DEFAULT_SL_PCT) or MomentumEngine.DEFAULT_SL_PCT)
+        except Exception:
+            sl_pct = MomentumEngine.DEFAULT_SL_PCT
+        sl_pct = max(0.0005, min(sl_pct, 0.05))
+
         entry = float(ltp)
+        sl_px = round(entry * (1.0 - sl_pct), 2) if side_key == "mom_bull" else round(entry * (1.0 + sl_pct), 2)
 
-        if side_key == "mom_bull":
-            sl_px = float(trig_candle.get("low", 0) or 0)
-        else:
-            sl_px = float(trig_candle.get("high", 0) or 0)
-
-        if sl_px <= 0:
-            sl_px = round(entry * (0.995 if side_key == "mom_bull" else 1.005), 2)
-
-        # qty sizing
-        risk_per_share = max(abs(entry - sl_px), entry * 0.005)
+        risk_per_share = max(abs(entry - sl_px), entry * 0.0005)
         risk_amount = float(cfg.get("risk_trade_1", 2000) or 2000)
         qty = floor(risk_amount / risk_per_share)
 
         if qty <= 0:
-            logger.warning(f"[MOM] {symbol} qty<=0 (risk calc). rollback reservations.")
             await TradeControl.rollback_symbol_trade(symbol)
             await TradeControl.rollback_side_trade(side_key)
             MomentumEngine._reset_waiting(stock)
             return
 
-        # Targets / trail
+        # Target / trailing
         try:
             rr_val = float(str(cfg.get("risk_reward", "1:2")).split(":")[-1])
         except Exception:
             rr_val = 2.0
 
-        if side_key == "mom_bull":
-            target = round(entry + (risk_per_share * rr_val), 2)
-        else:
-            target = round(entry - (risk_per_share * rr_val), 2)
+        target = round(entry + (risk_per_share * rr_val), 2) if side_key == "mom_bull" else round(entry - (risk_per_share * rr_val), 2)
 
         try:
             tsl_ratio = float(str(cfg.get("trailing_sl", "1:1.5")).split(":")[-1])
         except Exception:
             tsl_ratio = 1.5
-
         trail_step = float(risk_per_share * tsl_ratio) if tsl_ratio > 0 else float(risk_per_share)
 
-        # -------------------- place order --------------------
         try:
             logger.info(
                 f"🧾 [MOM-ORDER] {symbol} {side_key.upper()} "
-                f"txn={txn_type} qty={qty} entry={entry:.2f} sl={sl_px:.2f} tgt={target:.2f}"
+                f"txn={'BUY' if txn_type==kite.TRANSACTION_TYPE_BUY else 'SELL'} "
+                f"qty={qty} entry={entry:.2f} sl={sl_px:.2f} tgt={target:.2f}"
             )
 
             order_id = await asyncio.to_thread(
@@ -416,13 +398,6 @@ class MomentumEngine:
             stock["mom_active_trade"] = trade
             stock["mom_side_latch"] = side_key
 
-            # clear trigger so we don't re-enter
-            stock.pop("mom_trigger_px", None)
-
-            # scanner fields reset
-            stock["mom_scan_seen_ts"] = None
-            stock["mom_scan_seen_time"] = None
-
             logger.info(f"🚀 [MOM-ENTRY] {symbol} {side_key.upper()} order={order_id} qty={qty}")
 
         except Exception as e:
@@ -440,13 +415,8 @@ class MomentumEngine:
         if not trade:
             return
 
-        symbol = stock.get("symbol") or ""
+        symbol = (stock.get("symbol") or "").strip().upper()
         side_key = (stock.get("mom_side_latch") or "").lower()
-        if side_key not in ("mom_bull", "mom_bear"):
-            logger.warning(f"[MOM] {symbol} open trade invalid mom_side_latch; forcing close")
-            await MomentumEngine.close_position(stock, state, "BAD_SIDE_LATCH")
-            return
-
         is_bull = (side_key == "mom_bull")
 
         entry = float(trade.get("entry_price", 0) or 0)
@@ -478,18 +448,14 @@ class MomentumEngine:
             await MomentumEngine.close_position(stock, state, "SL")
             return
 
-        # Step trailing SL
         new_sl = MomentumEngine._step_trail_sl(trade, float(ltp), is_bull)
         if new_sl is not None:
             cur = float(trade.get("sl_price", 0) or 0)
             if is_bull and new_sl > cur:
                 trade["sl_price"] = float(new_sl)
-                logger.debug(f"[MOM-TRAIL] {symbol} SL -> {new_sl:.2f}")
             elif (not is_bull) and new_sl < cur:
                 trade["sl_price"] = float(new_sl)
-                logger.debug(f"[MOM-TRAIL] {symbol} SL -> {new_sl:.2f}")
 
-        # Manual exit (legacy)
         if symbol in state.get("manual_exits", set()):
             logger.info(f"🖱️ [MOM-MANUAL] {symbol}")
             await MomentumEngine.close_position(stock, state, "MANUAL")
@@ -517,7 +483,7 @@ class MomentumEngine:
     async def close_position(stock: dict, state: dict, reason: str):
         trade = stock.get("mom_active_trade")
         kite = state.get("kite")
-        symbol = stock.get("symbol") or ""
+        symbol = (stock.get("symbol") or "").strip().upper()
         side_key = (stock.get("mom_side_latch") or "").lower()
 
         is_bull = (side_key == "mom_bull")
@@ -527,7 +493,6 @@ class MomentumEngine:
 
         if trade and kite and symbol and txn_type:
             try:
-                logger.info(f"🏁 [MOM-EXIT] {symbol} reason={reason} qty={trade.get('qty')} txn={txn_type}")
                 exit_id = await asyncio.to_thread(
                     kite.place_order,
                     variety=kite.VARIETY_REGULAR,
@@ -539,6 +504,7 @@ class MomentumEngine:
                     order_type=kite.ORDER_TYPE_MARKET,
                 )
                 trade["exit_order_id"] = exit_id
+                logger.info(f"🏁 [MOM-EXIT] {symbol} reason={reason} exit_order={exit_id}")
             except Exception as e:
                 logger.error(f"❌ [MOM-EXIT-FAIL] {symbol}: {e}")
 
@@ -547,12 +513,8 @@ class MomentumEngine:
             trade["exit_time"] = datetime.now(IST).strftime("%H:%M:%S")
             trade["exit_reason"] = reason
 
-        # release open lock
         if symbol:
-            try:
-                await TradeControl.release_symbol_lock(symbol)
-            except Exception as e:
-                logger.warning(f"[MOM] {symbol} release lock failed: {e}")
+            await TradeControl.release_symbol_lock(symbol)
 
         MomentumEngine._reset_waiting(stock)
 
@@ -563,10 +525,7 @@ class MomentumEngine:
     def _reset_waiting(stock: dict):
         stock["mom_status"] = "WAITING"
         stock["mom_active_trade"] = None
-
-        stock.pop("mom_trigger_px", None)
         stock.pop("mom_side_latch", None)
-        stock.pop("mom_trigger_candle", None)
 
         stock["mom_scan_seen_ts"] = None
         stock["mom_scan_seen_time"] = None
@@ -575,17 +534,10 @@ class MomentumEngine:
 
     @staticmethod
     def _within_trade_window(cfg: dict, now: Optional[datetime] = None) -> bool:
-        """
-        cfg keys:
-          trade_start: "HH:MM"
-          trade_end:   "HH:MM"
-        """
-        from datetime import time as dtime
-
         try:
             now = now or datetime.now(IST)
             start_s = str(cfg.get("trade_start", "09:15"))
-            end_s = str(cfg.get("trade_end", "09:17"))
+            end_s = str(cfg.get("trade_end", "15:10"))
             sh, sm = map(int, start_s.split(":"))
             eh, em = map(int, end_s.split(":"))
             start_t = dtime(sh, sm)
