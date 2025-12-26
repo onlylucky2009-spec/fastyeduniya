@@ -1544,17 +1544,98 @@ def _safe_int(x, d=0) -> int:
         return d
 
 
+# def _compute_sma_from_records(records: List[dict]) -> float:
+#     """
+#     records: list of daily candles with volume/high/low/close etc.
+#     SMA definition used in your app:
+#       avg_vol_per_minute = (sum(last 5 sessions volume)) / 1875
+#     1875 = 5 days * 375 minutes/session (NSE regular)
+#     """
+#     if len(records) < 6:
+#         return 0.0
+#     last_5 = records[-6:-1]  # last 5 completed sessions
+#     total_vol = sum(_safe_int(day.get("volume", 0), 0) for day in last_5)
+#     avg_vol_per_minute = total_vol / 1875.0
+#     return round(avg_vol_per_minute, 2)
+
+
+# async def _fetch_one(
+#     kite: KiteConnect,
+#     t_id: int,
+#     symbol: str,
+#     sem: asyncio.Semaphore,
+# ) -> Tuple[int, str, bool, float, Optional[dict]]:
+#     """
+#     Fetch historical -> compute SMA -> build market_data
+#     Returns:
+#       (token, symbol, eligible, sma, market_data_if_any)
+#     """
+#     async with sem:
+#         try:
+#             to_date = _now_ist()
+#             from_date = to_date - timedelta(days=HIST_LOOKBACK_DAYS)
+
+#             # network call in thread (kiteconnect is sync)
+#             records = await asyncio.to_thread(
+#                 kite.historical_data,
+#                 t_id,
+#                 from_date,
+#                 to_date,
+#                 CANDLE_INTERVAL,
+#             )
+
+#             sma = _compute_sma_from_records(records)
+#             if sma < MIN_VOL_SMA:
+#                 return (t_id, symbol, False, sma, None)
+
+#             last_5 = records[-6:-1]
+#             last = last_5[-1]
+
+#             market_data = {
+#                 "symbol": symbol,
+#                 "sma": float(sma),
+#                 "pdh": _safe_float(last.get("high", 0.0), 0.0),
+#                 "pdl": _safe_float(last.get("low", 0.0), 0.0),
+#                 "prev_close": _safe_float(last.get("close", 0.0), 0.0),
+#                 "sync_time": _now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+#             }
+
+#             return (t_id, symbol, True, sma, market_data)
+
+#         except Exception as e:
+#             logger.debug(f"Error syncing {symbol} ({t_id}): {e}")
+#             return (t_id, symbol, False, 0.0, None)
+
+#         finally:
+#             # Zerodha historical rate-limit friendliness
+#             await asyncio.sleep(REQ_SLEEP)
+
 def _compute_sma_from_records(records: List[dict]) -> float:
     """
-    records: list of daily candles with volume/high/low/close etc.
-    SMA definition used in your app:
-      avg_vol_per_minute = (sum(last 5 sessions volume)) / 1875
-    1875 = 5 days * 375 minutes/session (NSE regular)
+    Dynamically identifies the last 5 completed sessions.
     """
-    if len(records) < 6:
+    if not records:
         return 0.0
-    last_5 = records[-6:-1]  # last 5 completed sessions
-    total_vol = sum(_safe_int(day.get("volume", 0), 0) for day in last_5)
+
+    # Get today's date in IST to check if the last candle is 'live'
+    today_ist = datetime.now(IST).date()
+    
+    # Kite historical dates can be datetime objects or strings
+    last_candle_date = records[-1]["date"]
+    if isinstance(last_candle_date, datetime):
+        last_candle_date = last_candle_date.date()
+    
+    # If the last candle is TODAY, we exclude it to get completed sessions
+    # If the last candle is PREVIOUS DAY (pre-market run), we keep it
+    if last_candle_date == today_ist:
+        completed_records = records[-6:-1]
+    else:
+        completed_records = records[-5:]
+
+    if len(completed_records) < 5:
+        return 0.0
+
+    total_vol = sum(_safe_int(day.get("volume", 0), 0) for day in completed_records)
     avg_vol_per_minute = total_vol / 1875.0
     return round(avg_vol_per_minute, 2)
 
@@ -1565,17 +1646,11 @@ async def _fetch_one(
     symbol: str,
     sem: asyncio.Semaphore,
 ) -> Tuple[int, str, bool, float, Optional[dict]]:
-    """
-    Fetch historical -> compute SMA -> build market_data
-    Returns:
-      (token, symbol, eligible, sma, market_data_if_any)
-    """
     async with sem:
         try:
             to_date = _now_ist()
             from_date = to_date - timedelta(days=HIST_LOOKBACK_DAYS)
 
-            # network call in thread (kiteconnect is sync)
             records = await asyncio.to_thread(
                 kite.historical_data,
                 t_id,
@@ -1584,33 +1659,44 @@ async def _fetch_one(
                 CANDLE_INTERVAL,
             )
 
-            sma = _compute_sma_from_records(records)
+            if not records:
+                return (t_id, symbol, False, 0.0, None)
+
+            # --- DYNAMIC PREVIOUS DAY SELECTION ---
+            today_ist = to_date.date()
+            last_record_date = records[-1]["date"]
+            if isinstance(last_record_date, datetime):
+                last_record_date = last_record_date.date()
+
+            # Identify the last COMPLETED session
+            if last_record_date == today_ist:
+                # Market is open or it's after 9:15, last record is today
+                last_completed_session = records[-2]
+                sma = _compute_sma_from_records(records)
+            else:
+                # It's pre-market, last record is the actual previous day
+                last_completed_session = records[-1]
+                sma = _compute_sma_from_records(records)
+
             if sma < MIN_VOL_SMA:
                 return (t_id, symbol, False, sma, None)
-
-            last_5 = records[-6:-1]
-            last = last_5[-1]
 
             market_data = {
                 "symbol": symbol,
                 "sma": float(sma),
-                "pdh": _safe_float(last.get("high", 0.0), 0.0),
-                "pdl": _safe_float(last.get("low", 0.0), 0.0),
-                "prev_close": _safe_float(last.get("close", 0.0), 0.0),
+                "pdh": _safe_float(last_completed_session.get("high", 0.0), 0.0),
+                "pdl": _safe_float(last_completed_session.get("low", 0.0), 0.0),
+                "prev_close": _safe_float(last_completed_session.get("close", 0.0), 0.0),
                 "sync_time": _now_ist().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
             return (t_id, symbol, True, sma, market_data)
 
         except Exception as e:
-            logger.debug(f"Error syncing {symbol} ({t_id}): {e}")
+            logger.error(f"Error syncing {symbol}: {e}")
             return (t_id, symbol, False, 0.0, None)
-
         finally:
-            # Zerodha historical rate-limit friendliness
             await asyncio.sleep(REQ_SLEEP)
-
-
 async def _persist_results(results: List[Tuple[int, str, bool, float, Optional[dict]]]) -> Tuple[List[int], List[str]]:
     """
     Parallel Redis writes (safe).
